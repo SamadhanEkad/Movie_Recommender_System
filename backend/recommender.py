@@ -1,3 +1,27 @@
+"""
+===========================================================================
+RECOMMENDER (Backend runtime module used by frontend/app.py)
+===========================================================================
+Job of this file
+    The notebook (movie_recommender_system.ipynb) BUILDS the model once.
+    This file LOADS that model and answers: "which 5 movies are similar?"
+    A notebook cannot be imported by Streamlit, so this small module is
+    the bridge between the notebook's pickle files and app.py.
+
+Libraries used
+    pickle / pandas / numpy : load the saved data and rank similarity scores
+    requests                : call the TMDB API to get movie posters
+    functools.lru_cache     : load files once, remember poster URLs
+
+Files needed in backend/
+    movie_dict.pkl, similarity.pkl   (created by the notebook)
+
+TMDB API key (never write it in code)
+    Local          : .streamlit/secrets.toml  ->  TMDB_API_KEY = "your_key"
+    Streamlit Cloud: App Settings > Secrets   ->  TMDB_API_KEY = "your_key"
+===========================================================================
+"""
+
 import os
 import pickle
 from functools import lru_cache
@@ -9,23 +33,28 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-
-# ==============================
-# Paths and configuration
-# ==============================
+# --------------------------------------------------------------------------
+# 1. Configuration
+# --------------------------------------------------------------------------
 BACKEND_DIR = Path(__file__).resolve().parent
 PLACEHOLDER_POSTER = "https://placehold.co/300x450/1f2937/ffffff?text=Poster+Unavailable"
 
-# TMDB API key is loaded from the environment.
-# Set TMDB_API_KEY locally or in Streamlit Cloud > Secrets.
+
+def get_api_key():
+    """Read the TMDB key from Streamlit secrets, else from an environment variable."""
+    try:
+        import streamlit as st
+        return st.secrets["TMDB_API_KEY"]
+    except Exception:
+        return os.getenv("TMDB_API_KEY")
 
 
-# ==============================
-# Data and model loading
-# ==============================
+# --------------------------------------------------------------------------
+# 2. Load the model (runs once)
+# --------------------------------------------------------------------------
 @lru_cache(maxsize=1)
 def load_recommender_data():
-    """Load the movie catalog and similarity matrix once."""
+    """Return (movies DataFrame, similarity matrix) saved by the notebook."""
     with open(BACKEND_DIR / "movie_dict.pkl", "rb") as file:
         movies = pd.DataFrame(pickle.load(file))
     with open(BACKEND_DIR / "similarity.pkl", "rb") as file:
@@ -35,45 +64,33 @@ def load_recommender_data():
 
 @lru_cache(maxsize=1)
 def get_title_lookup():
-    """Build a title lookup once for faster movie matching."""
+    """Map lowercase title -> row number, for fast matching."""
     movies, _ = load_recommender_data()
-    return {
-        str(title).lower(): index
-        for index, title in zip(movies.index, movies["title"].tolist())
-    }
+    return {str(title).lower(): i for i, title in enumerate(movies["title"])}
 
 
+# app.py imports these two (e.g. movies["title"] fills the dropdown)
 movies, similarity = load_recommender_data()
 
 
-# ==============================
-# Poster fetching
-# ==============================
-# Reusable session that automatically retries on flaky connections
+# --------------------------------------------------------------------------
+# 3. Poster fetching (TMDB API)
+# --------------------------------------------------------------------------
+# One shared session that retries automatically on slow / failed connections
 _session = requests.Session()
-_session.mount(
-    "https://",
-    HTTPAdapter(
-        max_retries=Retry(
-            total=3,                                  # up to 3 retries per request
-            backoff_factor=0.5,                       # wait 0.5s, 1s, 2s between tries
-            status_forcelist=[429, 500, 502, 503, 504],
-        )
-    ),
-)
+_session.mount("https://", HTTPAdapter(max_retries=Retry(
+    total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])))
 
 
 @lru_cache(maxsize=512)
 def _get_poster_url(movie_id):
-    """Fetch a poster URL from TMDB. Raises on failure so errors are NOT cached."""
-    api_key = os.getenv("TMDB_API_KEY")
+    """Ask TMDB for the poster. Errors are raised, so failures are never cached."""
+    api_key = get_api_key()
     if not api_key:
         raise ValueError("TMDB_API_KEY is not set")
     response = _session.get(
         f"https://api.themoviedb.org/3/movie/{movie_id}",
-        params={"api_key": api_key},
-        timeout=10,
-    )
+        params={"api_key": api_key}, timeout=10)
     response.raise_for_status()
     poster_path = response.json().get("poster_path")
     if not poster_path:
@@ -82,39 +99,31 @@ def _get_poster_url(movie_id):
 
 
 def fetch_poster(movie_id):
-    """Return a movie poster URL, or a placeholder if unavailable."""
+    """Return the poster URL, or a placeholder image if anything fails."""
     try:
         return _get_poster_url(movie_id)
     except (requests.RequestException, ValueError) as error:
-        # Printed in the terminal so the real failure reason is visible
         print(f"Poster failed for movie_id={movie_id}: {error}")
         return PLACEHOLDER_POSTER
 
 
-# ==============================
-# Recommendation logic
-# ==============================
+# --------------------------------------------------------------------------
+# 4. Recommendation
+# --------------------------------------------------------------------------
 def recommend(movie, poster_fetcher=None):
-    """Return five recommended movie names and poster URLs.
+    """Return (5 movie titles, 5 poster URLs) most similar to `movie`.
 
-    An optional poster fetcher allows the frontend to provide its
-    cached poster function while preserving the backend default.
+    poster_fetcher is optional: app.py can pass its own cached function.
     """
     movie_index = get_title_lookup().get(str(movie).strip().lower())
     if movie_index is None:
         raise ValueError("Movie not found")
 
-    # Rank movies by similarity (highest first), skip the selected movie itself
-    distances = similarity[movie_index]
-    ranked_indexes = np.argsort(distances)[::-1]
-    top_indexes = [index for index in ranked_indexes if index != movie_index][:5]
+    # Highest similarity first; skip the selected movie itself
+    ranked = np.argsort(similarity[movie_index])[::-1]
+    top5 = [i for i in ranked if i != movie_index][:5]
 
-    recommended_movies = []
-    recommended_posters = []
-    poster_fetcher = poster_fetcher or fetch_poster
-    for index in top_indexes:
-        row = movies.iloc[index]
-        recommended_movies.append(str(row["title"]))
-        recommended_posters.append(poster_fetcher(int(row["movie_id"])))
-
-    return recommended_movies, recommended_posters
+    get_poster = poster_fetcher or fetch_poster
+    names = [str(movies.iloc[i]["title"]) for i in top5]
+    posters = [get_poster(int(movies.iloc[i]["movie_id"])) for i in top5]
+    return names, posters
